@@ -1,11 +1,9 @@
 package staticgzip
 
 import (
-	"errors"
 	"net/http"
 	"net/url"
 	"os"
-	"path"
 	"path/filepath"
 	"strings"
 
@@ -62,6 +60,8 @@ var (
 	DefaultStaticConfig = StaticConfig{
 		Skipper: middleware.DefaultSkipper,
 		Index:   "index.html",
+		Gzip:    true,
+		Brotli:  true,
 	}
 )
 
@@ -98,68 +98,49 @@ func MiddlewareWithConfig(config StaticConfig) echo.MiddlewareFunc {
 			}
 
 			p := c.Request().URL.Path
+
 			if strings.HasSuffix(c.Path(), "*") { // When serving from a group, e.g. `/static*`.
 				p = c.Param("*")
 			}
+
 			p, err = url.PathUnescape(p)
+
 			if err != nil {
 				return
 			}
-			name := filepath.Join(config.Root, filepath.Clean("/"+p)) // "/"+ for security
 
-			if config.IgnoreBase {
-				routePath := path.Base(strings.TrimRight(c.Path(), "/*"))
-				baseURLPath := path.Base(p)
-				if baseURLPath == routePath {
-					i := strings.LastIndex(name, routePath)
-					name = name[:i] + strings.Replace(name[i:], routePath, "", 1)
-				}
-			}
+			name := filepath.Clean("/" + p) // "/"+ for security
+			info, err := os.Stat(filepath.Join(config.Root, name))
 
-			file, err := openFile(c, config.Filesystem, name, config.Gzip, config.Brotli)
 			if err != nil {
+				// Any error other than "Not exists" is an error
 				if !os.IsNotExist(err) {
-					return err
+					return echo.NewHTTPError(404, "Not found")
 				}
 
+				// Check if next route is valid - if so, return
 				if err = next(c); err == nil {
 					return err
 				}
 
-				var he *echo.HTTPError
-				if !(errors.As(err, &he) && config.HTML5 && he.Code == http.StatusNotFound) {
-					return err
+				// Route everything to index.html in SPA mode
+				if config.HTML5 {
+					name = config.Index
+				} else if he, ok := err.(*echo.HTTPError); !ok || he.Code != http.StatusNotFound {
+					return echo.NewHTTPError(404, "Not found")
 				}
-
-				file, err = openFile(c, config.Filesystem, filepath.Join(config.Root, config.Index), config.Gzip, config.Brotli)
-				if err != nil {
-					return err
-				}
+			} else if info.IsDir() {
+				name = filepath.Join(name, config.Index)
 			}
 
-			defer file.Close()
+			if info, err = os.Stat(name); err != nil {
+				return echo.NewHTTPError(404, "Not found")
+			}
 
-			info, err := file.Stat()
+			file, err := pickFile(c, config.Filesystem, name, config.Gzip, config.Brotli)
+
 			if err != nil {
-				return err
-			}
-
-			if info.IsDir() {
-				index, err := openFile(c, config.Filesystem, filepath.Join(name, config.Index), config.Gzip, config.Brotli)
-				if err != nil {
-					if os.IsNotExist(err) {
-						return next(c)
-					}
-				}
-
-				defer index.Close()
-
-				info, err = index.Stat()
-				if err != nil {
-					return err
-				}
-
-				return serveFile(c, index, info)
+				return echo.NewHTTPError(404, "Not found")
 			}
 
 			return serveFile(c, file, info)
@@ -167,12 +148,11 @@ func MiddlewareWithConfig(config StaticConfig) echo.MiddlewareFunc {
 	}
 }
 
-func openFile(c echo.Context, fs http.FileSystem, name string, gzip bool, brotli bool) (file http.File, err error) {
-	pathWithSlashes := filepath.ToSlash(name)
+func pickFile(c echo.Context, fs http.FileSystem, name string, gzip bool, brotli bool) (file http.File, err error) {
 	acceptedEncodings := c.Request().Header.Get(echo.HeaderAcceptEncoding)
 
-	if brotli && strings.Contains(acceptedEncodings, brotliEncoding) {
-		file, err = fs.Open(pathWithSlashes + brotliExtension)
+	if strings.Contains(acceptedEncodings, brotliEncoding) {
+		file, err = openFile(fs, name+brotliExtension)
 
 		if err == nil {
 			c.Response().Header().Set(echo.HeaderContentEncoding, brotliEncoding)
@@ -180,8 +160,8 @@ func openFile(c echo.Context, fs http.FileSystem, name string, gzip bool, brotli
 		}
 	}
 
-	if gzip && strings.Contains(acceptedEncodings, gzipEncoding) {
-		file, err = fs.Open(pathWithSlashes + gzipExtension)
+	if strings.Contains(acceptedEncodings, gzipEncoding) {
+		file, err = openFile(fs, name+gzipExtension)
 
 		if err == nil {
 			c.Response().Header().Set(echo.HeaderContentEncoding, gzipEncoding)
@@ -189,6 +169,13 @@ func openFile(c echo.Context, fs http.FileSystem, name string, gzip bool, brotli
 		}
 	}
 
+	file, err = openFile(fs, name)
+
+	return
+}
+
+func openFile(fs http.FileSystem, name string) (file http.File, err error) {
+	pathWithSlashes := filepath.ToSlash(name)
 	return fs.Open(pathWithSlashes)
 }
 
