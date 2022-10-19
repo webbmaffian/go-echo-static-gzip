@@ -88,7 +88,6 @@ func MiddlewareWithConfig(config StaticConfig) echo.MiddlewareFunc {
 	}
 	if config.Filesystem == nil {
 		config.Filesystem = http.Dir(config.Root)
-		config.Root = "."
 	}
 
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
