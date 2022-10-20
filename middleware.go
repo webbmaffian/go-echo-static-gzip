@@ -4,18 +4,12 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
 	"github.com/labstack/echo/v4"
 	"github.com/labstack/echo/v4/middleware"
-)
-
-const (
-	gzipEncoding    = "gzip"
-	gzipExtension   = ".gz"
-	brotliEncoding  = "br"
-	brotliExtension = ".br"
 )
 
 type (
@@ -37,31 +31,27 @@ type (
 		// Optional. Default value false.
 		HTML5 bool `yaml:"html5"`
 
-		// Whether there might be static Gzip files
-		Gzip bool `yaml:"gzip"`
+		// Encodings (as the header `Accept-Encoding`) in the preferred order.
+		Encodings []string
 
-		// Whether there might be static Brotli files
-		Brotli bool `yaml:"brotli"`
+		// File encodings - must match the length and order of Encodings.
+		EncodingExtensions []string
 
 		// Enable ignoring of the base of the URL path.
 		// Example: when assigning a static middleware to a non root path group,
 		// the filesystem path is not doubled
 		// Optional. Default value false.
 		IgnoreBase bool `yaml:"ignoreBase"`
-
-		// Filesystem provides access to the static content.
-		// Optional. Defaults to http.Dir(config.Root)
-		Filesystem http.FileSystem `yaml:"-"`
 	}
 )
 
 var (
 	// DefaultStaticConfig is the default Static middleware config.
 	DefaultStaticConfig = StaticConfig{
-		Skipper: middleware.DefaultSkipper,
-		Index:   "index.html",
-		Gzip:    true,
-		Brotli:  true,
+		Skipper:            middleware.DefaultSkipper,
+		Index:              "index.html",
+		Encodings:          []string{"br", "gzip"},
+		EncodingExtensions: []string{".br", ".gz"},
 	}
 )
 
@@ -74,7 +64,6 @@ func Middleware(root string) echo.MiddlewareFunc {
 }
 
 // MiddlewareWithConfig returns a Static middleware with config.
-// See `Static()`.
 func MiddlewareWithConfig(config StaticConfig) echo.MiddlewareFunc {
 	// Defaults
 	if config.Root == "" {
@@ -86,9 +75,18 @@ func MiddlewareWithConfig(config StaticConfig) echo.MiddlewareFunc {
 	if config.Index == "" {
 		config.Index = DefaultStaticConfig.Index
 	}
-	if config.Filesystem == nil {
-		config.Filesystem = http.Dir(config.Root)
+	if config.Encodings == nil {
+		config.Encodings = DefaultStaticConfig.Encodings
 	}
+	if config.EncodingExtensions == nil {
+		config.EncodingExtensions = DefaultStaticConfig.EncodingExtensions
+	}
+
+	if len(config.Encodings) != len(config.EncodingExtensions) {
+		panic("length of encodings and extensions must match")
+	}
+
+	fs := http.Dir(config.Root)
 
 	return func(next echo.HandlerFunc) echo.HandlerFunc {
 		return func(c echo.Context) (err error) {
@@ -108,13 +106,20 @@ func MiddlewareWithConfig(config StaticConfig) echo.MiddlewareFunc {
 				return
 			}
 
-			name := filepath.Clean("/" + p) // "/"+ for security
-			info, err := os.Stat(filepath.Join(config.Root, name))
+			p = filepath.Clean("/" + p) // "/"+ for security
+
+			// Short circuit
+			if p == "/" {
+				p = config.Index
+			}
+
+			f, err := openFile(c, fs, p, config.Encodings, config.EncodingExtensions)
 
 			if err != nil {
+
 				// Any error other than "Not exists" is an error
 				if !os.IsNotExist(err) {
-					return echo.NewHTTPError(404, "Not found")
+					return echo.ErrNotFound
 				}
 
 				// Check if next route is valid - if so, return
@@ -122,63 +127,71 @@ func MiddlewareWithConfig(config StaticConfig) echo.MiddlewareFunc {
 					return err
 				}
 
-				// Route everything to index.html in SPA mode
+				// Route everything to index in SPA mode
 				if config.HTML5 {
-					name = config.Index
-				} else if he, ok := err.(*echo.HTTPError); !ok || he.Code != http.StatusNotFound {
-					return echo.NewHTTPError(404, "Not found")
+					p = config.Index
+					f, err = fs.Open(p)
+
+					if err != nil {
+						return echo.ErrNotFound
+					}
+				} else {
+					return echo.ErrNotFound
 				}
-			} else if info.IsDir() {
-				name = filepath.Join(name, config.Index)
 			}
 
-			if info, err = os.Stat(name); err != nil {
-				return echo.NewHTTPError(404, "Not found")
-			}
-
-			file, err := pickFile(c, config.Filesystem, name, config.Gzip, config.Brotli)
+			info, err := f.Stat()
 
 			if err != nil {
-				return echo.NewHTTPError(404, "Not found")
+				return echo.ErrNotFound
 			}
 
-			return serveFile(c, file, info)
+			if info.IsDir() {
+				// Route everything to index in SPA mode
+				if config.HTML5 {
+					p = config.Index
+					f, err = fs.Open(p)
+				} else {
+					p = filepath.Join(p, config.Index)
+					f, err = openFile(c, fs, p, config.Encodings, config.EncodingExtensions)
+				}
+
+				if err != nil {
+					return echo.ErrNotFound
+				}
+
+				info, err = f.Stat()
+
+				if err != nil {
+					return echo.ErrNotFound
+				}
+			}
+
+			return serveFile(c, f, info, p)
 		}
 	}
 }
 
-func pickFile(c echo.Context, fs http.FileSystem, name string, gzip bool, brotli bool) (file http.File, err error) {
-	acceptedEncodings := c.Request().Header.Get(echo.HeaderAcceptEncoding)
+func openFile(c echo.Context, fs http.FileSystem, p string, encodings []string, encodingExtensions []string) (file http.File, err error) {
+	if acceptEncoding := c.Request().Header.Get(echo.HeaderAcceptEncoding); acceptEncoding != "" {
+		for i, enc := range encodings {
+			if !strings.Contains(acceptEncoding, enc) {
+				continue
+			}
 
-	if strings.Contains(acceptedEncodings, brotliEncoding) {
-		file, err = openFile(fs, name+brotliExtension)
-
-		if err == nil {
-			c.Response().Header().Set(echo.HeaderContentEncoding, brotliEncoding)
-			return
+			if file, err = fs.Open(p + encodingExtensions[i]); err == nil {
+				c.Response().Header().Set(echo.HeaderContentEncoding, encodings[i])
+				return
+			}
 		}
 	}
 
-	if strings.Contains(acceptedEncodings, gzipEncoding) {
-		file, err = openFile(fs, name+gzipExtension)
-
-		if err == nil {
-			c.Response().Header().Set(echo.HeaderContentEncoding, gzipEncoding)
-			return
-		}
-	}
-
-	file, err = openFile(fs, name)
+	file, err = fs.Open(p)
 
 	return
 }
 
-func openFile(fs http.FileSystem, name string) (file http.File, err error) {
-	pathWithSlashes := filepath.ToSlash(name)
-	return fs.Open(pathWithSlashes)
-}
-
-func serveFile(c echo.Context, file http.File, info os.FileInfo) error {
-	http.ServeContent(c.Response(), c.Request(), info.Name(), info.ModTime(), file)
+func serveFile(c echo.Context, file http.File, info os.FileInfo, name string) error {
+	http.ServeContent(c.Response(), c.Request(), path.Base(name), info.ModTime(), file)
 	return nil
 }
